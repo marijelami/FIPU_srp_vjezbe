@@ -1,5 +1,12 @@
 '''
 Skripta za generiranje dimenzijskog modela podataka -> star schema
+Ova skripta demonstrira cijeli proces:
+1. Konekcija na bazu podataka
+2. Definicija modela (dimenzije i činjenice)
+3. Brisanje starih tablica
+4. Kreiranje novih tablica
+5. ETL proces - punjenje podacima
+6. Verifikacija rezultata
 '''
 
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, ForeignKey, Float
@@ -15,31 +22,37 @@ Session = sessionmaker(bind=engine)
 session = Session()
 Base = declarative_base()
 
+# ========== DEFINICIJA DIMENZIJSKIH I FACT TABLICA ==========
+# U dimenzijskom modelu (star schema):
+# - Dimenzijske tablice (dim_) sadrže opisne atribute - TKO, ŠTO, GDJE, KADA
+# - Fact tablice (fact_) sadrže mjerljive numeričke vrijednosti - KOLIKO, VRIJEDNOST, MARGINA
+
 # Definicija dimenzijskih tablica i fact tablica
 class DimCountry(Base):
     __tablename__ = 'dim_country'
     __table_args__ = {'schema': 'dw'}
 
-    country_tk = Column(BigInteger, primary_key=True, autoincrement=True)
-    version = Column(Integer)
+    country_tk = Column(BigInteger, primary_key=True, autoincrement=True) # country_tk - surogatni ključ (Surrogate Key), umjetni primarni ključ - Koristi se umjesto prirodnog ključa (country_id) radi bolje kontrole i performansi
+    version = Column(Integer)  
     date_from = Column(DateTime)
     date_to = Column(DateTime)
-    country_id = Column(Integer, index=True)
-    name = Column(String(45))
-    population = Column(Integer)
-    region = Column(String(45))
+    # Poslovni atributi dimenzije
+    country_id = Column(Integer, index=True) # Prirodni ključ iz izvornog sustava
+    name = Column(String(45))  # Naziv države
+    population = Column(Integer) # Broj stanovnika
+    region = Column(String(45)) # Regija kojoj država pripada
 
 
 class DimProduct(Base):
     __tablename__ = 'dim_product'
     __table_args__ = {'schema': 'dw'}
 
-    product_tk = Column(BigInteger, primary_key=True, autoincrement=True)
+    product_tk = Column(BigInteger, primary_key=True, autoincrement=True) # Surogatni ključ
     version = Column(Integer)
-    date_from = Column(DateTime)
+    date_from = Column(DateTime)   # SCD Type 2 - praćenje promjena kroz vrijeme
     date_to = Column(DateTime)
-    product_id = Column(Integer, index=True)
-    product_name = Column(String(256))
+    product_id = Column(Integer, index=True) 
+    product_name = Column(String(256)) # Naziv pojedinačnog proizvoda
     product_type_name = Column(String(256))
     product_line_name = Column(String(256))
 
@@ -82,15 +95,19 @@ class FactSales(Base):
     __tablename__ = 'fact_sales'
     __table_args__ = {'schema': 'dw'}
 
-    fact_sales_tk = Column(BigInteger, primary_key=True, autoincrement=True)
-    country_tk = Column(BigInteger, ForeignKey('dw.dim_country.country_tk'))
-    retailer_tk = Column(BigInteger, ForeignKey('dw.dim_retailer.retailer_tk'))
-    product_tk = Column(BigInteger, ForeignKey('dw.dim_product.product_tk'))
-    order_method_tk = Column(BigInteger, ForeignKey('dw.dim_order_method.order_method_tk'))
-    date_tk = Column(Integer, ForeignKey('dw.dim_date.date_tk'))
-    revenue = Column(Float)
-    quantity = Column(BigInteger)
-    gross_margin = Column(Float)
+    fact_sales_tk = Column(BigInteger, primary_key=True, autoincrement=True) # Primarni ključ
+
+# Strani ključevi prema svim dimenzijama (zvijezda - star schema)
+# Ovi ključevi povezuju činjenice s kontekstom (dimenzijama)
+    country_tk = Column(BigInteger, ForeignKey('dw.dim_country.country_tk')) # Gdje je prodano
+    retailer_tk = Column(BigInteger, ForeignKey('dw.dim_retailer.retailer_tk')) # Tko je prodao
+    product_tk = Column(BigInteger, ForeignKey('dw.dim_product.product_tk')) # Što je prodano
+    order_method_tk = Column(BigInteger, ForeignKey('dw.dim_order_method.order_method_tk')) # Kako je prodano
+    date_tk = Column(Integer, ForeignKey('dw.dim_date.date_tk')) # Kada je prodano
+# Mjere (Measures) - numeričke vrijednosti koje analiziramo 
+    revenue = Column(Float) # Prihod od prodaje
+    quantity = Column(BigInteger) # Količina prodanih proizvoda
+    gross_margin = Column(Float) # Bruto marža (profitabilnost)
 
 
 # Testiranje koncekcije
@@ -100,8 +117,13 @@ with engine.connect() as conn:
     print("Konekcija uspješna!")
 
 # Obriši postojeće tablice ako postoje
+# Brišemo tablice ako postoje da bi mogli kreirati nove iz početka
+# Ovo je korisno tijekom razvoja, ali u produkciji bi se radilo drugačije!
 print("\nBrišem postojeće tablice...")
 try:
+# checkfirst=True prvo provjerava postoji li tablica prije brisanja
+# Brišemo u obrnutom redoslijedu od kreiranja zbog stranih ključeva
+# (prvo fact tablica koja referencira dimenzije, pa onda dimenzije)
     FactSales.__table__.drop(engine, checkfirst=True)
     DimDate.__table__.drop(engine, checkfirst=True)
     DimOrderMethod.__table__.drop(engine, checkfirst=True)
@@ -114,12 +136,14 @@ except:
 
 # Kreiraj dimenzijske tablice
 print("\nKreiram dimenzijske tablice...")
-Base.metadata.create_all(engine)
+Base.metadata.create_all(engine) # Base.metadata.create_all stvara sve tablice definirane ORM klasama
 print("Dimenzijske tablice kreirane!")
 
 # POPUNJAVANJE PODACIMA (ETL)
+# ETL = Extract (izvlačenje), Transform (transformacija), Load (punjenje)
 
 print("\nPopunjavam dimenzijske tablice podacima...")
+# EXTRACT: SQL upit za dohvat podataka iz izvorne baze
 
 # 1. dim_retailer
 print("   Popunjavam dim_retailer...")
@@ -130,10 +154,13 @@ SELECT DISTINCT
     rt.speciality_store AS speciality_store
 FROM retailer_type rt
 """
-df_retailers = pd.read_sql(retailers_query, engine)
-df_retailers['version'] = 1
-df_retailers['date_from'] = '1900-01-01'
-df_retailers['date_to'] = '9999-12-31'
+# Pandas read_sql izvršava upit i sprema rezultat u DataFrame
+df_retailers = pd.read_sql(retailers_query, engine) # TRANSFORM: Dodavanje SCD Type 2 atributa
+df_retailers['version'] = 1 # Prva verzija svakog zapisa
+df_retailers['date_from'] = '1900-01-01' # Početak važenja - minimalni datum
+df_retailers['date_to'] = '9999-12-31' # Kraj važenja - maksimalni datum (još uvijek aktivno)
+# LOAD: Spremanje u dimenzijsku tablicu
+# if_exists='append' dodaje nove retke, ne briše postojeće
 df_retailers.to_sql('dim_retailer', engine, schema='dw', if_exists='append', index=False)
 print(f"      Uneseno {len(df_retailers)} redaka")
 
@@ -201,6 +228,8 @@ ORDER BY year, quarter
 df_dates = pd.read_sql(dates_query, engine)
 
 # Obrada kvartala
+# TRANSFORMACIJA: Pretvaranje 'Q1' u broj 1, 'Q2' u 2, itd.
+# str.extract(r'(\d+)') izvlači samo broj iz stringa (npr. 'Q1' -> '1')
 df_dates['quarter_num'] = df_dates['quarter'].str.extract(r'(\d+)').astype(int)
 
 # Finalni dataframe
@@ -224,20 +253,23 @@ with engine.connect() as conn:
 fact_query = """
 INSERT INTO dw.fact_sales (retailer_tk, product_tk, country_tk, order_method_tk, date_tk, revenue, quantity, gross_margin)
 SELECT 
-    dr.retailer_tk,
-    dp.product_tk,
-    dc.country_tk,
-    dom.order_method_tk,
-    dd.date_tk,
-    s.revenue,
-    s.quantity,
-    s.gross_margin
+    dr.retailer_tk, -- surograt prodavača 
+    dp.product_tk, -- surogat proizvoda
+    dc.country_tk, -- surogat država
+    dom.order_method_tk, -- surogat načina narudžbe
+    dd.date_tk, -- surogat datuma
+    s.revenue, -- mjera prihoda od prodaje
+    s.quantity, -- mjera količine prodanih proizvoda
+    s.gross_margin -- mjera bruto marže (profitabilnosti)
 FROM sales s
+-- Svaki JOIN povezuje izvornu tablicu s dimenzijom preko prirodnog ključa
+-- Uvjet date_to = '9999-12-31' osigurava da uzimamo samo trenutno aktivne verzije dimenzija
 INNER JOIN dim_retailer dr ON s.retailer_type_fk = dr.retailer_id AND dr.date_to = '9999-12-31'
 INNER JOIN dim_product dp ON s.product_fk = dp.product_id AND dp.date_to = '9999-12-31'
 INNER JOIN dim_country dc ON s.country_fk = dc.country_id AND dc.date_to = '9999-12-31'
 INNER JOIN dim_order_method dom ON s.order_method_fk = dom.order_method_id AND dom.date_to = '9999-12-31'
 INNER JOIN dim_date dd ON s.year = dd.year 
+    -- Ponovno ekstrakcija broja iz 'Q1', 'Q2' itd. za spajanje s numeričkim kvartalom
     AND CAST(SUBSTRING(s.quarter, 2, 1) AS UNSIGNED) = dd.quarter
 """
 
